@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m365-graph"
+version = "0.1.0"
+description = "A small Microsoft Graph client: one sign-in, a cached token, requests that don't hang."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["msal>=1.28"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

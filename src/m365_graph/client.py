@@ -52,6 +52,50 @@ def unattended() -> bool:
 _APPS: dict = {}     # (cache file, client, tenant) -> (MSAL app, its token cache, {scopes: (token, expires)})
 
 
+
+# ---- the token cache file -------------------------------------------------------------------------
+# Several programs share one cache (the EA's watchers, prep engine and triage all wake together).
+# Until 0.1.1 it was rewritten in place, so two writers could interleave: on 10 Nov 2026 a shorter
+# write over a longer one left two stray characters after the JSON, and every tool then failed to
+# start with "Extra data". Writes now go to a temporary file swapped in with os.replace, which is
+# atomic, and Windows' brief sharing locks ("Permission denied" while another process has the file
+# open) are retried.
+
+def _retrying(action, tries: int = 10):
+    for attempt in range(tries):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+
+
+def _read_cache(path: pathlib.Path) -> str:
+    """The cache's JSON. A file damaged by an older writer keeps its first complete JSON value
+    rather than stopping every program that shares it."""
+    text = _retrying(lambda: path.read_text(encoding="utf-8"))
+    try:
+        json.loads(text)
+        return text
+    except ValueError:
+        data, _ = json.JSONDecoder().raw_decode(text.lstrip())
+        return json.dumps(data)
+
+
+def _write_cache(path: pathlib.Path, text: str) -> bool:
+    """Replace the cache in one step. False if Windows kept it locked; the caller tries again later."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    try:
+        _retrying(lambda: os.replace(temp, path))
+        return True
+    except PermissionError:
+        temp.unlink(missing_ok=True)
+        return False
+
+
 class Client:
     def __init__(self, cache_path: os.PathLike | str | None = None, tenant: str = "organizations",
                  client_id: str = GRAPH_CLI_CLIENT, login_hint: str | None = None,
@@ -73,7 +117,7 @@ class Client:
         if key not in _APPS:
             cache = msal.SerializableTokenCache()
             if self.cache_path.exists():
-                cache.deserialize(self.cache_path.read_text(encoding="utf-8"))
+                cache.deserialize(_read_cache(self.cache_path))
             app = msal.PublicClientApplication(
                 self.client_id, authority=f"https://login.microsoftonline.com/{self.tenant}",
                 token_cache=cache, timeout=TIMEOUT)
@@ -103,10 +147,8 @@ class Client:
                 raise SignInNeeded(f"No cached sign-in for {', '.join(scopes)}, or it has expired. {self.sign_in_hint}")
             self.log("Opening a browser to sign in to Microsoft...")
             result = app.acquire_token_interactive(scopes, login_hint=self.login_hint)
-        if cache.has_state_changed:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(cache.serialize(), encoding="utf-8")
-            cache.has_state_changed = False
+        if cache.has_state_changed and _write_cache(self.cache_path, cache.serialize()):
+            cache.has_state_changed = False   # else the next token() call tries the write again
         if "access_token" not in result:
             raise SignInNeeded(f"Sign-in failed: {result.get('error')}: {result.get('error_description', '')[:300]}")
         tokens[tuple(scopes)] = (result["access_token"], time.time() + int(result.get("expires_in", 3600)))

@@ -28,8 +28,13 @@ import urllib.error
 import urllib.request
 
 import msal
+import requests   # MSAL's own HTTP library: its connection errors are what a sign-in refresh raises
 
 GRAPH = "https://graph.microsoft.com/v1.0"
+# A dropped or reset connection, from urllib (requests to Graph) or requests (MSAL's sign-in refresh).
+# ConnectionError is the builtin, which covers ConnectionResetError and http.client.RemoteDisconnected.
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError,
+                  requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 # Microsoft's own public "Microsoft Graph Command Line Tools" app. Works in most tenants without
 # registering an app; an admin may still have to approve scopes that need admin consent.
 GRAPH_CLI_CLIENT = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
@@ -138,7 +143,7 @@ class Client:
         result = None
         accounts = app.get_accounts()
         if accounts:
-            result = app.acquire_token_silent(scopes, account=accounts[0])
+            result = self._silently(app, scopes, accounts[0])
             # A scope never consented to comes back as an error dict, not None.
             if result and "access_token" not in result:
                 result = None
@@ -153,6 +158,19 @@ class Client:
             raise SignInNeeded(f"Sign-in failed: {result.get('error')}: {result.get('error_description', '')[:300]}")
         tokens[tuple(scopes)] = (result["access_token"], time.time() + int(result.get("expires_in", 3600)))
         return result["access_token"]
+
+    def _silently(self, app, scopes: list, account):
+        """acquire_token_silent, retried on a dropped connection. MSAL refreshes over HTTP (with requests), and
+        the odd connection reset from login.microsoftonline.com otherwise failed the whole run: it happened to
+        onenote-sync on 10 Nov 2026 (0.1.2), and to teams-channel-notes and the transcript watcher before that."""
+        for attempt in range(1, RETRIES + 1):
+            try:
+                return app.acquire_token_silent(scopes, account=account)
+            except NETWORK_ERRORS as error:
+                if attempt == RETRIES:
+                    raise
+                self.log(f"sign-in refresh retry {attempt} in {5 * attempt}s: {type(error).__name__}")
+                time.sleep(5 * attempt)
 
     # ---- requests -----------------------------------------------------------------------------
 
@@ -177,7 +195,7 @@ class Client:
                 if error.code not in (429, 500, 502, 503, 504) or attempt == RETRIES:
                     raise
                 wait = int(error.headers.get("Retry-After") or 5 * attempt)
-            except (urllib.error.URLError, TimeoutError):
+            except NETWORK_ERRORS:   # HTTPError is a URLError, but it's caught above
                 if attempt == RETRIES:
                     raise
                 wait = 5 * attempt

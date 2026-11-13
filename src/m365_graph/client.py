@@ -14,6 +14,11 @@ What it's for, from running several unattended tools against Graph:
   SignInNeeded instead, and the caller can notify someone.
 - **Scopes per call.** Ask only for what a call needs, so a new consent for one tool never breaks another.
 - **A timeout and retries** for stalls, 429s and 5xx. A stalled connection once hung a run for 30 minutes.
+- **A write is never sent twice.** A 502, 504, timeout or dropped connection can come *after* Graph has
+  acted, so a POST resent then can create a second event or answer an invite twice (seen during the
+  13 Nov 2026 Microsoft outage). Reads, and writes that land the same however often they're sent, are
+  retried as before; any other write is retried only when Graph certainly didn't act (a 429, or a
+  connection that never opened). See resend_ok().
 - **IPv4 first** (net.py), which fixed sign-ins that took minutes.
 """
 
@@ -22,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import socket
 import sys
 import time
 import urllib.error
@@ -42,6 +48,41 @@ DEFAULT_CACHE = pathlib.Path(os.environ.get("LOCALAPPDATA", pathlib.Path.home())
 TIMEOUT = 60
 RETRIES = 3
 SLOW = 15
+
+
+# Writes that land the same however often they're sent. PATCH sets properties on most of Graph, but
+# a OneNote page's content PATCH inserts and appends, so it isn't one.
+IDEMPOTENT = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+READ_ONLY_POSTS = ("/getSchedule", "/findMeetingTimes")   # POSTs that only read
+
+
+def idempotent(method: str, url: str) -> bool:
+    """Whether sending this request twice has the same effect as sending it once."""
+    method = method.upper()
+    path = url.split("?", 1)[0]
+    if method in IDEMPOTENT:
+        return True
+    if method == "PATCH":
+        return "/onenote/" not in path
+    return method == "POST" and path.endswith(READ_ONLY_POSTS)
+
+
+def never_sent(error: BaseException) -> bool:
+    """A failure before the request reached anyone: the connection was refused or the name didn't
+    resolve. A timeout, reset or 5xx can all come after Graph has acted."""
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+
+
+def resend_ok(method: str, url: str, error: BaseException, retry_writes: bool | None = None) -> bool:
+    """Whether a failed request may be sent again. retry_writes=True/False overrides the method's own
+    rule, for a caller that knows better (False: never resend, even a PUT)."""
+    safe = idempotent(method, url) if retry_writes is None else retry_writes
+    if safe:
+        return True
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 429          # throttled: refused before anything was done
+    return never_sent(error)
 
 
 class SignInNeeded(PermissionError, RuntimeError):
@@ -175,11 +216,17 @@ class Client:
     # ---- requests -----------------------------------------------------------------------------
 
     def request(self, url: str, method: str = "GET", body: dict | None = None, scopes: list | tuple | None = None,
-                headers: dict | None = None, interactive: bool | None = None) -> dict:
-        """One Graph request. url may be relative ("/me") or a full URL (such as an @odata.nextLink)."""
+                headers: dict | None = None, interactive: bool | None = None,
+                retry_writes: bool | None = None) -> dict:
+        """One Graph request. url may be relative ("/me") or a full URL (such as an @odata.nextLink).
+
+        A failed write that may have reached Graph isn't resent (see resend_ok); the error is raised, so
+        the caller's next run sees what actually happened. A DELETE resent after one that may have
+        landed, and answered 404, counts as done."""
         if not url.startswith("http"):
             url = GRAPH + url
         data = json.dumps(body).encode("utf-8") if body is not None else None
+        uncertain = False     # an earlier attempt may have reached Graph
         for attempt in range(1, RETRIES + 1):
             request = urllib.request.Request(url, data=data, method=method, headers={
                 "Authorization": f"Bearer {self.token(scopes, interactive)}",
@@ -192,12 +239,23 @@ class Client:
                     self.log(f"slow Graph call: {time.time() - started:.0f}s {method} {url[:120]}")
                 return json.loads(raw) if raw else {}
             except urllib.error.HTTPError as error:
+                if error.code == 404 and uncertain and method.upper() == "DELETE":
+                    return {}
                 if error.code not in (429, 500, 502, 503, 504) or attempt == RETRIES:
                     raise
+                if not resend_ok(method, url, error, retry_writes):
+                    self.log(f"Graph {error.code} on a write that may have landed; not resent: {method} {url[:120]}")
+                    raise
+                uncertain = uncertain or error.code != 429
                 wait = int(error.headers.get("Retry-After") or 5 * attempt)
-            except NETWORK_ERRORS:   # HTTPError is a URLError, but it's caught above
+            except NETWORK_ERRORS as error:   # HTTPError is a URLError, but it's caught above
                 if attempt == RETRIES:
                     raise
+                if not resend_ok(method, url, error, retry_writes):
+                    self.log(f"Graph {type(error).__name__} on a write that may have landed; not resent: "
+                             f"{method} {url[:120]}")
+                    raise
+                uncertain = uncertain or not never_sent(error)
                 wait = 5 * attempt
             self.log(f"Graph retry {attempt} in {wait}s: {method} {url[:120]}")
             time.sleep(wait)

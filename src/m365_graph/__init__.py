@@ -4,7 +4,9 @@ Importing it makes connections prefer IPv4 (see net.py).
 """
 
 from . import net  # noqa: F401  (prefer IPv4, process-wide)
-from .client import DEFAULT_CACHE, GRAPH, GRAPH_CLI_CLIENT, Client, SignInNeeded, unattended
+from .client import (DEFAULT_CACHE, GRAPH, GRAPH_CLI_CLIENT, Client, SignInNeeded, idempotent, never_sent,
+                     resend_ok, unattended)
 
-__version__ = "0.1.2"
-__all__ = ["Client", "SignInNeeded", "unattended", "GRAPH", "GRAPH_CLI_CLIENT", "DEFAULT_CACHE"]
+__version__ = "0.2.0"
+__all__ = ["Client", "SignInNeeded", "unattended", "GRAPH", "GRAPH_CLI_CLIENT", "DEFAULT_CACHE",
+           "idempotent", "never_sent", "resend_ok"]
